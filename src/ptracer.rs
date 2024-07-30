@@ -1,13 +1,14 @@
 //! Types for attaching to processes, managing tracees, and interpreting tracing events.
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::ffi::{c_long, c_void};
 use std::io;
 use std::marker::PhantomData;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command};
 use std::time::Duration;
 
+use nix::sys::ptrace::AddressType;
 use nix::{
     errno::Errno,
     sys::{
@@ -30,8 +31,8 @@ use x86::DebugRegister;
 #[cfg(target_arch = "aarch64")]
 pub type DebugRegisters = aarch64::user_hwdebug_state;
 
-pub use nix::unistd::Pid;
 pub use nix::sys::ptrace::Options;
+pub use nix::unistd::Pid;
 
 /// POSIX signal.
 pub use nix::sys::signal::Signal;
@@ -76,10 +77,7 @@ pub enum Stop {
     Fork { new: Pid },
     Exec { old: Pid },
     Exiting { exit_code: i32 },
-    Signaling {
-        signal: Signal,
-        core_dumped: bool,
-    },
+    Signaling { signal: Signal, core_dumped: bool },
     Vfork { new: Pid },
     VforkDone { new: Pid },
     Seccomp { data: u16 },
@@ -110,11 +108,18 @@ pub struct Tracee {
 }
 
 impl Tracee {
+    const WORD_SIZE: usize = std::mem::size_of::<c_long>();
+
     pub fn new(pid: Pid, pending: impl Into<Option<Signal>>, stop: Stop) -> Self {
         let pending = pending.into();
         let _not_send = PhantomData;
 
-        Self { pid, pending, stop, _not_send }
+        Self {
+            pid,
+            pending,
+            stop,
+            _not_send,
+        }
     }
 
     /// Set a signal to deliver to the stopped process upon restart.
@@ -139,7 +144,6 @@ impl Tracee {
 
     #[cfg(target_arch = "aarch64")]
     pub fn registers(&self) -> Result<Registers> {
-
         let mut data = std::mem::MaybeUninit::uninit();
         let mut rv = libc::iovec {
             iov_base: &mut data as *mut _ as *mut libc::c_void,
@@ -147,12 +151,17 @@ impl Tracee {
         };
 
         let res = unsafe {
-            libc::ptrace(libc::PTRACE_GETREGSET, self.pid, NT_PRSTATUS, &mut rv as *mut _ as *mut libc::c_void)
+            libc::ptrace(
+                libc::PTRACE_GETREGSET,
+                self.pid,
+                NT_PRSTATUS,
+                &mut rv as *mut _ as *mut libc::c_void,
+            )
         };
 
         Errno::result(res)?;
 
-        Ok( unsafe { data.assume_init() } )
+        Ok(unsafe { data.assume_init() })
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -168,7 +177,12 @@ impl Tracee {
         };
 
         let res = unsafe {
-            libc::ptrace(libc::PTRACE_SETREGSET, self.pid, NT_PRSTATUS, &mut rv as *mut _ as *mut libc::c_void)
+            libc::ptrace(
+                libc::PTRACE_SETREGSET,
+                self.pid,
+                NT_PRSTATUS,
+                &mut rv as *mut _ as *mut libc::c_void,
+            )
         };
 
         Errno::result(res)?;
@@ -177,41 +191,44 @@ impl Tracee {
     }
 
     pub fn read_memory(&mut self, addr: u64, len: usize) -> Result<Vec<u8>> {
-        let mut data = Vec::with_capacity(len);
-        data.resize(len, 0);
-        let len_read = self.read_memory_mut(addr, &mut data)?;
-        data.truncate(len_read);
+        let mut data = vec![0u8; len];
+        self.read_memory_mut(addr, &mut data)?;
+
         Ok(data)
     }
 
-    pub fn read_memory_mut(&self, addr: u64, data: &mut [u8]) -> Result<usize> {
-        use std::os::unix::fs::FileExt;
+    pub fn read_memory_mut(&self, addr: u64, data: &mut [u8]) -> Result<()> {
+        for (i, chunk) in data.chunks_mut(Self::WORD_SIZE).enumerate() {
+            let word = ptrace::read(
+                self.pid,
+                (addr + (i * Self::WORD_SIZE) as u64) as AddressType,
+            )?;
+            let bytes = word.to_ne_bytes();
 
-        let mem = self.memory()?;
-        let len = mem.read_at(data, addr)?;
-        Ok(len)
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+
+        Ok(())
     }
 
-    pub fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<usize> {
-        use std::os::unix::fs::FileExt;
+    pub fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<()> {
+        for (i, chunk) in data.chunks(Self::WORD_SIZE).enumerate() {
+            let addr = addr + (i * Self::WORD_SIZE) as u64;
+            let mut orig_bytes = ptrace::read(self.pid, addr as AddressType)?.to_ne_bytes();
 
-        let mem = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(self.proc_mem_path())?;
+            let len = chunk.len().min(Self::WORD_SIZE);
+            orig_bytes[..len].copy_from_slice(&chunk[i..len]);
 
-        let len = mem.write_at(data, addr)?;
+            unsafe {
+                ptrace::write(
+                    self.pid,
+                    addr as AddressType,
+                    c_long::from_ne_bytes(orig_bytes) as *mut c_void,
+                )?
+            };
+        }
 
-        Ok(len)
-    }
-
-    fn proc_mem_path(&self) -> String {
-        let tid = self.pid.as_raw() as u32;
-        format!("/proc/{}/mem", tid)
-    }
-
-    pub fn memory(&self) -> Result<fs::File> {
-        Ok(fs::File::open(self.proc_mem_path())?)
+        Ok(())
     }
 
     pub fn siginfo(&self) -> Result<Option<Siginfo>> {
@@ -243,7 +260,12 @@ impl Tracee {
             iov_len: std::mem::size_of::<aarch64::user_hwdebug_state>(),
         };
         let res = unsafe {
-            libc::ptrace(libc::PTRACE_GETREGSET, self.pid, regtype, &mut rv as *mut _ as *mut libc::c_void)
+            libc::ptrace(
+                libc::PTRACE_GETREGSET,
+                self.pid,
+                regtype,
+                &mut rv as *mut _ as *mut libc::c_void,
+            )
         };
 
         Errno::result(res)?;
@@ -263,13 +285,22 @@ impl Tracee {
     }
 
     #[cfg(target_arch = "aarch64")]
-    pub fn set_debug_registers(&self, regtype: aarch64::DebugRegisterType, mut state: DebugRegisters) -> Result<()> {
+    pub fn set_debug_registers(
+        &self,
+        regtype: aarch64::DebugRegisterType,
+        mut state: DebugRegisters,
+    ) -> Result<()> {
         let mut rv = libc::iovec {
             iov_base: &mut state as *mut _ as *mut libc::c_void,
             iov_len: std::mem::size_of::<aarch64::user_hwdebug_state>(),
         };
         let res = unsafe {
-            libc::ptrace(libc::PTRACE_SETREGSET, self.pid, regtype, &mut rv as *mut _ as *mut libc::c_void)
+            libc::ptrace(
+                libc::PTRACE_SETREGSET,
+                self.pid,
+                regtype,
+                &mut rv as *mut _ as *mut libc::c_void,
+            )
         };
 
         Errno::result(res)?;
@@ -284,14 +315,7 @@ impl Tracee {
         //
         // See: https://github.com/torvalds/linux/blob/v4.9/arch/x86/kernel/ptrace.c#L774-L791
 
-        let data = unsafe {
-            libc::ptrace(
-                libc::PTRACE_PEEKUSER,
-                self.pid,
-                off,
-                0,
-            )
-        };
+        let data = unsafe { libc::ptrace(libc::PTRACE_PEEKUSER, self.pid, off, 0) };
 
         Ok(data as u64)
     }
@@ -303,14 +327,7 @@ impl Tracee {
         //
         // See: https://github.com/torvalds/linux/blob/v4.9/arch/x86/kernel/ptrace.c#L774-L791
 
-        unsafe {
-            libc::ptrace(
-                libc::PTRACE_POKEUSER,
-                self.pid,
-                off,
-                data,
-            )
-        };
+        unsafe { libc::ptrace(libc::PTRACE_POKEUSER, self.pid, off, data) };
 
         Ok(())
     }
@@ -357,7 +374,11 @@ impl Ptracer {
         let poll_delay = DEFAULT_POLL_DELAY;
         let tracees = BTreeMap::new();
 
-        Self { options, poll_delay, tracees }
+        Self {
+            options,
+            poll_delay,
+            tracees,
+        }
     }
 
     /// Returns a reference to the default ptrace options applied to newly-spawned tracees.
@@ -385,12 +406,9 @@ impl Ptracer {
         let Tracee { pid, pending, .. } = tracee;
 
         let r = match restart {
-            Restart::Step =>
-                ptrace::step(pid, pending),
-            Restart::Continue =>
-                ptrace::cont(pid, pending),
-            Restart::Syscall =>
-                ptrace::syscall(pid, pending),
+            Restart::Step => ptrace::step(pid, pending),
+            Restart::Continue => ptrace::cont(pid, pending),
+            Restart::Syscall => ptrace::syscall(pid, pending),
         };
 
         r.died_if_esrch(pid)?;
@@ -405,7 +423,9 @@ impl Ptracer {
     pub fn spawn(&mut self, mut cmd: Command) -> Result<Child> {
         // On fork, request `PTRACE_TRACEME`.
         unsafe {
-            cmd.pre_exec(|| ptrace::traceme().map_err(|err| io::Error::from_raw_os_error(err as i32)))
+            cmd.pre_exec(|| {
+                ptrace::traceme().map_err(|err| io::Error::from_raw_os_error(err as i32))
+            })
         };
 
         let child = cmd.spawn()?;
@@ -443,19 +463,19 @@ impl Ptracer {
                 Ok(WaitStatus::StillAlive) => {
                     // Alive, no state change. Check remaining tracees.
                     continue;
-                },
+                }
                 Ok(status) => {
                     // One of our tracees changed state.
                     return Ok(Some(status));
-                },
+                }
                 Err(errno) if errno == Errno::ECHILD => {
                     // No more children to wait on: we're done.
-                    return Ok(None)
-                },
+                    return Ok(None);
+                }
                 Err(err) => {
                     // Something else went wrong.
-                    return Err(err.into())
-                },
+                    return Err(err.into());
+                }
             };
         }
 
@@ -489,11 +509,11 @@ impl Ptracer {
             WaitStatus::Exited(pid, _exit_code) => {
                 self.remove_tracee(pid);
                 return self.wait();
-            },
+            }
             WaitStatus::Signaled(pid, _sig, _is_core_dump) => {
                 self.remove_tracee(pid);
                 return self.wait();
-            },
+            }
             WaitStatus::Stopped(pid, SIGTRAP) => {
                 let state = self.tracee_state_mut(pid);
 
@@ -524,7 +544,7 @@ impl Ptracer {
                     let stop = Stop::SignalDelivery { signal: SIGTRAP };
                     Tracee::new(pid, None, stop)
                 }
-            },
+            }
             WaitStatus::Stopped(pid, signal) => {
                 if signal == SIGSTOP {
                     if let Some(state) = self.tracee_state_mut(pid) {
@@ -534,8 +554,7 @@ impl Ptracer {
                             let tracee = Tracee::new(pid, None, stop);
                             return Ok(Some(tracee));
                         }
-                    }
-                    else {
+                    } else {
                         // We may see an attach-stop out-of-order, before the ptrace-event-stop
                         // which would otherwise have us mark it as `Attaching`. Since `Attaching`
                         // only exists to let us know that the next stop (i.e. this stop) is an
@@ -554,7 +573,7 @@ impl Ptracer {
                 };
 
                 Tracee::new(pid, signal, stop)
-            },
+            }
             WaitStatus::PtraceEvent(pid, signal, code) => {
                 match code {
                     libc::PTRACE_EVENT_FORK => {
@@ -567,7 +586,7 @@ impl Ptracer {
 
                         let stop = Stop::Fork { new };
                         Tracee::new(pid, signal, stop)
-                    },
+                    }
                     libc::PTRACE_EVENT_CLONE => {
                         let evt_data = ptrace::getevent(pid).died_if_esrch(pid)?;
                         let new = Pid::from_raw(evt_data as u32 as i32);
@@ -578,7 +597,7 @@ impl Ptracer {
 
                         let stop = Stop::Clone { new };
                         Tracee::new(pid, signal, stop)
-                    },
+                    }
                     libc::PTRACE_EVENT_EXEC => {
                         // We are in one of two cases. The exec has either occurred on the main
                         // thread of the thread group, or not. In either case, the new tid of the
@@ -605,7 +624,7 @@ impl Ptracer {
                         let stop = Stop::Exec { old };
 
                         Tracee::new(pid, signal, stop)
-                    },
+                    }
                     libc::PTRACE_EVENT_EXIT => {
                         // In this context, `PTRACE_GETEVENTMSG` returns the pending wait status
                         // as an `unsigned long`. We are only interested in the low 16-bit word.
@@ -614,14 +633,15 @@ impl Ptracer {
                         self.remove_tracee(pid);
 
                         let stop = match ExitType::parse(status)? {
-                            ExitType::Exit(exit_code) =>
-                                Stop::Exiting { exit_code },
-                            ExitType::Signaled(signal, core_dumped) =>
-                                Stop::Signaling { signal, core_dumped },
+                            ExitType::Exit(exit_code) => Stop::Exiting { exit_code },
+                            ExitType::Signaled(signal, core_dumped) => Stop::Signaling {
+                                signal,
+                                core_dumped,
+                            },
                         };
 
                         Tracee::new(pid, signal, stop)
-                    },
+                    }
                     libc::PTRACE_EVENT_VFORK => {
                         let evt_data = ptrace::getevent(pid).died_if_esrch(pid)?;
                         let new = Pid::from_raw(evt_data as u32 as i32);
@@ -630,14 +650,14 @@ impl Ptracer {
                         let stop = Stop::Vfork { new };
 
                         Tracee::new(pid, signal, stop)
-                    },
+                    }
                     libc::PTRACE_EVENT_VFORK_DONE => {
                         let evt_data = ptrace::getevent(pid).died_if_esrch(pid)?;
                         let new = Pid::from_raw(evt_data as u32 as i32);
-                        let stop = Stop::VforkDone {new };
+                        let stop = Stop::VforkDone { new };
 
                         Tracee::new(pid, signal, stop)
-                    },
+                    }
                     libc::PTRACE_EVENT_SECCOMP => {
                         // `SECCOMP_RET_DATA`, which is the low 16 bits of an int.
                         let data = ptrace::getevent(pid).died_if_esrch(pid)? as u16;
@@ -650,17 +670,17 @@ impl Ptracer {
                         }
 
                         Tracee::new(pid, signal, stop)
-                    },
+                    }
                     libc::PTRACE_EVENT_STOP => {
                         // Unreachable by us, since we do not expose `PTRACE_SEIZE` &c.
                         internal_error!("unreachable ptrace-event-stop")
-                    },
+                    }
                     _ => {
                         // All kernel-delivered `event` values are matched above.
                         internal_error!("unexpected ptrace-event-stop code")
-                    },
+                    }
                 }
-            },
+            }
             // A signal-delivery-stop never happens between syscall-enter-stop and syscall-exit-stop.
             // It will always happen _after_ syscall-exit-stop, and not necessarily immediately. We
             // may observe ptrace-event-stops in-between -enter and -exit.
@@ -695,17 +715,17 @@ impl Ptracer {
                             State::Syscalling => {
                                 *state = State::Traced;
                                 Stop::SyscallExit
-                            },
+                            }
                             State::Traced => {
                                 *state = State::Syscalling;
                                 Stop::SyscallEnter
-                            },
+                            }
                             State::Attaching => {
                                 // A tracee in this state is waiting for a `SIGSTOP`, which is an
                                 // artifact of `PTRACE_ATTACH`. The next wait status will thus be
                                 // either a `SIGSTOP`, `SIGKILL`, or a `PTRACE_EVENT_EXIT`.
                                 internal_error!("syscall-stop for `Attaching` tracee")
-                            },
+                            }
                             State::Spawned => {
                                 // We only set the tracee state to `Spawned` after a successful call
                                 // to `Command::spawn()` with a pre-exec `TRACEME` request.
@@ -715,21 +735,21 @@ impl Ptracer {
                                 // seen as a `SIGTRAP` signal-delivery-stop, not a syscall-stop or
                                 // ptrace-event-stop, and so we can never reach this case.
                                 internal_error!("syscall-stop for `Spawning` tracee")
-                            },
+                            }
                         }
-                    },
+                    }
                     None => {
                         // Assumes any pid we are tracing is also indexed in `self.tracees`.
                         internal_error!("syscall-stop for unregistered tracee")
-                    },
+                    }
                 };
 
                 Tracee::new(pid, None, stop)
-            },
+            }
             // Assume `!WNOHANG`, `!WCONTINUED`.
-            WaitStatus::Continued(_) |
-            WaitStatus::StillAlive =>
-                internal_error!("unreachable `wait()` status"),
+            WaitStatus::Continued(_) | WaitStatus::StillAlive => {
+                internal_error!("unreachable `wait()` status")
+            }
         };
 
         Ok(Some(tracee))
@@ -810,14 +830,11 @@ fn is_group_stop(pid: Pid, sig: Signal) -> Result<bool> {
             //     ("no such process") if a SIGKILL killed the tracee.)
             //
             match ptrace::getsiginfo(pid) {
-                Err(Errno::EINVAL) =>
-                    Ok(true),
-                Err(err) =>
-                    Err(err.into()),
-                Ok(_) =>
-                    Ok(false)
+                Err(Errno::EINVAL) => Ok(true),
+                Err(err) => Err(err.into()),
+                Ok(_) => Ok(false),
             }
-        },
+        }
         _ => {
             // Definitely not a group-stop.
             //
@@ -828,6 +845,6 @@ fn is_group_stop(pid: Pid, sig: Signal) -> Result<bool> {
             //     If the tracer sees something else, it can't be a group-stop.
             //
             Ok(false)
-        },
+        }
     }
 }
