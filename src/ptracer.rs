@@ -199,10 +199,7 @@ impl Tracee {
 
     pub fn read_memory_mut(&self, addr: u64, data: &mut [u8]) -> Result<()> {
         for (i, chunk) in data.chunks_mut(Self::WORD_SIZE).enumerate() {
-            let word = ptrace::read(
-                self.pid,
-                (addr + (i * Self::WORD_SIZE) as u64) as AddressType,
-            )?;
+            let word = self.read_memory_aligned(addr + (i * Self::WORD_SIZE) as u64)?;
             let bytes = word.to_ne_bytes();
 
             chunk.copy_from_slice(&bytes[..chunk.len()]);
@@ -219,14 +216,20 @@ impl Tracee {
             let len = chunk.len().min(Self::WORD_SIZE);
             orig_bytes[..len].copy_from_slice(&chunk[i..len]);
 
-            unsafe {
-                ptrace::write(
-                    self.pid,
-                    addr as AddressType,
-                    c_long::from_ne_bytes(orig_bytes) as *mut c_void,
-                )?
-            };
+            self.write_memory_aligned(addr, c_long::from_ne_bytes(orig_bytes))?;
         }
+
+        Ok(())
+    }
+
+    pub fn read_memory_aligned(&self, addr: u64) -> Result<c_long> {
+        let word = ptrace::read(self.pid, addr as AddressType)?;
+
+        Ok(word)
+    }
+
+    pub fn write_memory_aligned(&mut self, addr: u64, word: c_long) -> Result<()> {
+        unsafe { ptrace::write(self.pid, addr as AddressType, word as *mut c_void)? };
 
         Ok(())
     }

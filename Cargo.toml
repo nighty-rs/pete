@@ -8,9 +8,7 @@ readme = "README.md"
 authors = ["Joe Ranweiler <joe@lemma.co>"]
 repository = "https://github.com/ranweiler/pete"
 description = "A friendly wrapper around ptrace(2)"
-include = [
-    "src/",
-]
+include = ["src/"]
 
 [dependencies]
 libc = "0.2.99"
